@@ -153,6 +153,15 @@ def _get_marker(item):
         return item.get_marker("flaky")
 
 
+def _get_last_exception_name(report):
+    try:
+        last_reprentry = report.longrepr.reprtraceback.reprentries[-1]
+        last_exception_name = last_reprentry.reprfileloc.message
+    except AttributeError:
+        last_exception_name = None
+    return last_exception_name
+
+
 def get_reruns_count(item):
     rerun_marker = _get_marker(item)
     reruns = None
@@ -174,17 +183,24 @@ def get_reruns_count(item):
     return reruns
 
 
-def get_reruns_delay(item):
+def get_reruns_delay(item, context):
     rerun_marker = _get_marker(item)
 
     if rerun_marker is not None:
         if "reruns_delay" in rerun_marker.kwargs:
-            delay = rerun_marker.kwargs["reruns_delay"]
+            delay_expr = rerun_marker.kwargs["reruns_delay"]
         elif len(rerun_marker.args) > 1:
             # check for arguments
-            delay = rerun_marker.args[1]
+            delay_expr = rerun_marker.args[1]
         else:
-            delay = 0
+            delay_expr = 0
+
+        if isinstance(delay_expr, str):
+            filename = f"<{rerun_marker.name} delay_expr>"
+            delay_expr_code = compile(delay_expr, filename, "eval")
+            delay = eval(delay_expr_code, context)
+        else:
+            delay = delay_expr
     else:
         delay = item.session.config.option.reruns_delay
 
@@ -197,36 +213,28 @@ def get_reruns_delay(item):
     return delay
 
 
-def get_reruns_condition(item):
+def get_reruns_condition(item, context):
     rerun_marker = _get_marker(item)
 
     condition = True
     if rerun_marker is not None and "condition" in rerun_marker.kwargs:
         condition = evaluate_condition(
-            item, rerun_marker, rerun_marker.kwargs["condition"]
+            rerun_marker, rerun_marker.kwargs["condition"], context
         )
 
     return condition
 
 
-def evaluate_condition(item, mark, condition: object) -> bool:
+def evaluate_condition(mark, condition: object, context) -> bool:
     # copy from python3.8 _pytest.skipping.py
 
     result = False
     # String condition.
     if isinstance(condition, str):
-        globals_ = {
-            "os": os,
-            "sys": sys,
-            "platform": platform,
-            "config": item.config,
-        }
-        if hasattr(item, "obj"):
-            globals_.update(item.obj.__globals__)  # type: ignore[attr-defined]
         try:
             filename = f"<{mark.name} condition>"
             condition_code = compile(condition, filename, "eval")
-            result = eval(condition_code, globals_)
+            result = eval(condition_code, context)
         except SyntaxError as exc:
             msglines = [
                 "Error evaluating %r condition" % mark.name,
@@ -318,10 +326,10 @@ def _should_hard_fail_on_error(session_config, report):
     return True
 
 
-def _should_not_rerun(item, report, reruns):
+def _should_not_rerun(item, report, reruns, context):
     xfail = hasattr(report, "wasxfail")
     is_terminal_error = _should_hard_fail_on_error(item.session.config, report)
-    condition = get_reruns_condition(item)
+    condition = get_reruns_condition(item, context)
     return (
         item.execution_count > reruns
         or not report.failed
@@ -492,6 +500,19 @@ class ClientStatusDB(SocketDB):
         return int(self._sock_recv(self.sock))
 
 
+def _get_context(item):
+    item_context = {
+        "os": os,
+        "sys": sys,
+        "platform": platform,
+        "config": item.config,
+        "params": item.callspec.params,
+    }
+    if hasattr(item, "obj"):
+        item_context.update(item.obj.__globals__)
+    return item_context
+
+
 def pytest_runtest_protocol(item, nextitem):
     """
     Run the test protocol.
@@ -508,7 +529,6 @@ def pytest_runtest_protocol(item, nextitem):
     # while this doesn't need to be run with every item, it will fail on the
     # first item if necessary
     check_options(item.session.config)
-    delay = get_reruns_delay(item)
     parallel = not is_master(item.config)
     item_location = (item.location[0] + "::" + item.location[2]).replace("\\", "/")
     db = item.session.config.failures_db
@@ -522,16 +542,19 @@ def pytest_runtest_protocol(item, nextitem):
     while need_to_run:
         item.execution_count += 1
         item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+        context = _get_context(item)
         reports = runtestprotocol(item, nextitem=nextitem, log=False)
 
         for report in reports:  # 3 reports: setup, call, teardown
+            context["last_exception_name"] = _get_last_exception_name(report)
             report.rerun = item.execution_count - 1
-            if _should_not_rerun(item, report, reruns):
+            if _should_not_rerun(item, report, reruns, context):
                 # last run or no failure detected, log normally
                 item.ihook.pytest_runtest_logreport(report=report)
             else:
                 # failure detected and reruns not exhausted, since i < reruns
                 report.outcome = "rerun"
+                delay = get_reruns_delay(item, context)
                 time.sleep(delay)
 
                 if not parallel or works_with_current_xdist():
